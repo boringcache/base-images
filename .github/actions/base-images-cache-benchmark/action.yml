@@ -1,0 +1,221 @@
+name: Run one Immich base-images cache phase
+description: Build an exact upstream base-images commit with one native cache lane.
+inputs:
+  strategy: {required: true}
+  phase: {required: true}
+  source-sha: {required: true}
+  architecture: {required: true}
+  platform: {required: true}
+  target: {required: true}
+  repetition: {required: true}
+  cache-source-run-id: {required: false, default: ""}
+  cache-source-repetition: {required: false, default: ""}
+runs:
+  using: composite
+  steps:
+    - name: Start workflow timer
+      id: workflow-timer
+      shell: bash
+      run: echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout exact upstream source
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      with:
+        repository: immich-app/base-images
+        ref: ${{ inputs.source-sha }}
+        path: benchmark-source
+        persist-credentials: false
+
+    - name: Verify immutable source
+      shell: bash
+      env:
+        EXPECTED_SHA: ${{ inputs.source-sha }}
+      run: |
+        set -euo pipefail
+        [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "source-sha must be a full commit SHA" >&2; exit 1; }
+        actual_sha="$(git -C benchmark-source rev-parse HEAD)"
+        [[ "$actual_sha" == "$EXPECTED_SHA" ]] || { echo "Expected $EXPECTED_SHA, checked out $actual_sha" >&2; exit 1; }
+
+    - name: Prepare cache profile
+      id: profile
+      shell: bash
+      env:
+        STRATEGY: ${{ inputs.strategy }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+      run: |
+        set -euo pipefail
+        if [[ "$STRATEGY" == "boringcache-optimized" || "$STRATEGY" == "boringcache-no-layers" ]]; then
+          profile="ccache-mountcache"
+          ./scripts/stage-ccache-binary.sh "$ARCHITECTURE" benchmark-source/server/ccache
+        else
+          profile="upstream"
+        fi
+        python3 ./scripts/prepare-benchmark-source.py "$profile" benchmark-source
+        echo "name=$profile" >> "$GITHUB_OUTPUT"
+
+    - name: Select isolated cache scope
+      id: scope
+      shell: bash
+      env:
+        STRATEGY: ${{ inputs.strategy }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+        TARGET: ${{ inputs.target }}
+        REPETITION: ${{ inputs.repetition }}
+        CACHE_SOURCE_RUN_ID: ${{ inputs.cache-source-run-id }}
+        CACHE_SOURCE_REPETITION: ${{ inputs.cache-source-repetition }}
+      run: |
+        set -euo pipefail
+        if [[ "$STRATEGY" == "boringcache-no-layers" ]]; then
+          [[ "$CACHE_SOURCE_RUN_ID" =~ ^[0-9]+$ ]] || { echo "cache-source-run-id must identify the seeded workflow" >&2; exit 1; }
+          [[ "$CACHE_SOURCE_REPETITION" =~ ^[0-9]+$ ]] || { echo "cache-source-repetition must identify the seeded trial" >&2; exit 1; }
+          # Reuse only the optimized lane's ccache and mount-cache cohort. The
+          # build itself passes --no-cache, so its Docker layers are ignored.
+          cohort="immich-base-r${CACHE_SOURCE_RUN_ID}-n${CACHE_SOURCE_REPETITION}-${TARGET}-${ARCHITECTURE}-boringcache-optimized"
+        else
+          # Keep reruns in the original workflow cohort so a failed rebuild can
+          # still consume its seed. A new workflow run gets a new GITHUB_RUN_ID.
+          cohort="immich-base-r${GITHUB_RUN_ID}-n${REPETITION}-${TARGET}-${ARCHITECTURE}-${STRATEGY}"
+        fi
+        registry_image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/base-server-${TARGET}-benchmark"
+        registry_cache_ref="${registry_image}-build-cache:linux-${ARCHITECTURE}-r${GITHUB_RUN_ID}-n${REPETITION}"
+        echo "docker_tag=${cohort}-docker" >> "$GITHUB_OUTPUT"
+        echo "ccache_tag=${cohort}-ccache" >> "$GITHUB_OUTPUT"
+        echo "registry_cache_ref=${registry_cache_ref}" >> "$GITHUB_OUTPUT"
+        if [[ "$STRATEGY" == "registry" ]]; then
+          echo "reported_cache=${registry_cache_ref}" >> "$GITHUB_OUTPUT"
+        else
+          echo "reported_cache=${cohort}-docker" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Configure isolated BoringCache scopes
+      if: startsWith(inputs.strategy, 'boringcache')
+      shell: bash
+      run: |
+        python3 ./scripts/configure-benchmark-cache-scope.py .boringcache.toml \
+          --docker-tag "${{ steps.scope.outputs.docker_tag }}" \
+          --ccache-tag "${{ steps.scope.outputs.ccache_tag }}"
+
+    - name: Start provider timer
+      id: provider-timer
+      shell: bash
+      run: echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Buildx for GitHub Actions cache
+      if: inputs.strategy == 'gha' || inputs.strategy == 'registry'
+      uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+    - name: Login to GitHub Container Registry
+      if: inputs.strategy == 'registry'
+      uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.repository_owner }}
+        password: ${{ github.token }}
+
+    - name: Build with GitHub Actions cache
+      if: inputs.strategy == 'gha'
+      uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: benchmark-source/server
+        file: benchmark-source/server/Dockerfile
+        platforms: ${{ inputs.platform }}
+        target: ${{ inputs.target }}
+        push: false
+        load: false
+        cache-from: type=gha,scope=${{ steps.scope.outputs.docker_tag }}
+        cache-to: type=gha,scope=${{ steps.scope.outputs.docker_tag }},mode=max
+
+    - name: Build with upstream-style GHCR registry cache
+      if: inputs.strategy == 'registry'
+      uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: benchmark-source/server
+        file: benchmark-source/server/Dockerfile
+        platforms: ${{ inputs.platform }}
+        target: ${{ inputs.target }}
+        push: false
+        load: false
+        cache-from: type=registry,ref=${{ steps.scope.outputs.registry_cache_ref }}
+        cache-to: type=registry,ref=${{ steps.scope.outputs.registry_cache_ref }},mode=max,compression=zstd
+
+    - name: Build with BoringCache
+      id: boringcache
+      if: startsWith(inputs.strategy, 'boringcache')
+      uses: boringcache/one@e24257b122813ad11d53b9ed024b474ca4946ad2 # v1.19.1
+      with:
+        setup: none
+        mode: docker
+        trust-policy: publish
+        context: benchmark-source/server
+        dockerfile: benchmark-source/server/Dockerfile
+        image: immich-base-server-benchmark
+        tags: ${{ steps.scope.outputs.docker_tag }}
+        target: ${{ inputs.target }}
+        platforms: ${{ inputs.platform }}
+        push: false
+        load: false
+        no-cache: ${{ inputs.strategy == 'boringcache-no-layers' }}
+        docker-tool-cache: ${{ (inputs.strategy == 'boringcache-optimized' || inputs.strategy == 'boringcache-no-layers') && format('ccache:{0}', steps.scope.outputs.ccache_tag) || '' }}
+        docker-mount-cache: ${{ inputs.strategy == 'boringcache-optimized' || inputs.strategy == 'boringcache-no-layers' }}
+        fail-on-cache-error: true
+        metadata-hints: benchmark=immich-base-images,phase=${{ inputs.phase }},architecture=${{ inputs.architecture }},target=${{ inputs.target }},variant=${{ inputs.strategy }}
+
+    - name: Capture benchmark evidence
+      shell: bash
+      env:
+        STRATEGY: ${{ inputs.strategy }}
+        PHASE: ${{ inputs.phase }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+        PLATFORM: ${{ inputs.platform }}
+        TARGET: ${{ inputs.target }}
+        REPETITION: ${{ inputs.repetition }}
+        PROFILE: ${{ steps.profile.outputs.name }}
+        SOURCE_SHA: ${{ inputs.source-sha }}
+        PROVIDER_STARTED_AT: ${{ steps.provider-timer.outputs.started_at }}
+        WORKFLOW_STARTED_AT: ${{ steps.workflow-timer.outputs.started_at }}
+        CACHE_TAG: ${{ steps.boringcache.outputs.cache-tag || steps.scope.outputs.reported_cache }}
+        CACHE_WORKSPACE: ${{ steps.boringcache.outputs.workspace }}
+        CACHE_HIT: ${{ steps.boringcache.outputs.cache-hit }}
+        CACHE_IMPORT_READY: ${{ steps.boringcache.outputs.docker-cache-import-ready }}
+        CACHE_IMPORT_REFS: ${{ steps.boringcache.outputs.docker-cache-from-refs }}
+        EVIDENCE_PATH: ${{ steps.boringcache.outputs.evidence-path }}
+        NO_CACHE: ${{ inputs.strategy == 'boringcache-no-layers' && 'true' || 'false' }}
+        CACHE_SOURCE_RUN_ID: ${{ inputs.cache-source-run-id }}
+        CACHE_SOURCE_REPETITION: ${{ inputs.cache-source-repetition }}
+      run: |
+        set -euo pipefail
+        now="$(date +%s)"
+        python3 ./scripts/base-images-benchmark-report.py phase \
+          --strategy "$STRATEGY" \
+          --phase "$PHASE" \
+          --architecture "$ARCHITECTURE" \
+          --platform "$PLATFORM" \
+          --target "$TARGET" \
+          --repetition "$REPETITION" \
+          --profile "$PROFILE" \
+          --source-sha "$SOURCE_SHA" \
+          --provider-seconds "$(( now - PROVIDER_STARTED_AT ))" \
+          --workflow-seconds "$(( now - WORKFLOW_STARTED_AT ))" \
+          --cache-tag "$CACHE_TAG" \
+          --workspace "$CACHE_WORKSPACE" \
+          --cache-hit "$CACHE_HIT" \
+          --cache-import-ready "$CACHE_IMPORT_READY" \
+          --cache-import-refs "$CACHE_IMPORT_REFS" \
+          --no-cache "$NO_CACHE" \
+          --cache-source-run-id "$CACHE_SOURCE_RUN_ID" \
+          --cache-source-repetition "$CACHE_SOURCE_REPETITION" \
+          --evidence "$EVIDENCE_PATH"
+
+    - name: Upload phase evidence
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.2.0
+      with:
+        name: phase-r${{ inputs.repetition }}-${{ inputs.strategy }}-${{ inputs.architecture }}-${{ inputs.target }}-${{ inputs.phase }}
+        path: benchmark-results/
+        if-no-files-found: error
+        retention-days: 14

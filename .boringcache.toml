@@ -1,0 +1,12 @@
+workspace = "immich/base-images"
+
+[proxy]
+metadata-hints = ["project=immich-base-images"]
+
+[adapters.docker]
+tag = "immich-base-images-local"
+metadata-hints = ["tool=oci", "workload=server-base"]
+
+[adapters.ccache]
+tag = "immich-base-images-ccache-local"
+metadata-hints = ["tool=ccache", "workload=server-native"]
